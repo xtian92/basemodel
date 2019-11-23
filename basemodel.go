@@ -8,18 +8,48 @@ import (
 	"time"
 
 	"github.com/jinzhu/gorm"
+
+	// import mysql, postgres, and pq
+	_ "github.com/jinzhu/gorm/dialects/mysql"
+	_ "github.com/jinzhu/gorm/dialects/postgres"
+	_ "github.com/lib/pq"
+)
+
+// used constants
+const (
+	MysqlAdapter    string = "mysql_adapter"
+	PostgresAdapter string = "postgres_adapter"
 )
 
 type (
+	// DBConfig contains db configs
+	DBConfig struct {
+		Adapter        string
+		Host           string
+		Port           string
+		Username       string
+		Password       string
+		Table          string
+		Timezone       string
+		Maxlifetime    int
+		IdleConnection int
+		OpenConnection int
+		SSL            string
+		Logmode        bool
+	}
+
+	// BaseModel will be used as foundation of all models
 	BaseModel struct {
 		ID          uint64    `json:"id" sql:"AUTO_INCREMENT" gorm:"primary_key,column:id"`
 		CreatedTime time.Time `json:"created_time" gorm:"column:created_time" sql:"DEFAULT:current_timestamp"`
 		UpdatedTime time.Time `json:"updated_time" gorm:"column:updated_time" sql:"DEFAULT:current_timestamp"`
 	}
 
+	// DBFunc gorm trx function
 	DBFunc func(tx *gorm.DB) error
 
-	PagedSearchResult struct {
+	// PagedFindResult pagination format
+	PagedFindResult struct {
 		TotalData   int         `json:"total_data"`   // matched datas
 		Rows        int         `json:"rows"`         // shown datas per page
 		CurrentPage int         `json:"current_page"` // current page
@@ -29,28 +59,71 @@ type (
 		Data        interface{} `json:"data"`
 	}
 
+	// CompareFilter filter used for comparing 2 values
 	CompareFilter struct {
 		Value1 interface{} `json:"value1"`
 		Value2 interface{} `json:"value2"`
 	}
 )
 
-var db *gorm.DB
+// DB is a connected db instance
+var DB *gorm.DB
 
-// helper for inserting data using gorm.DB functions
+// Start set basemodel config
+func Start(conf DBConfig) {
+	switch conf.Adapter {
+	case MysqlAdapter:
+		connectionString := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true", conf.Username, conf.Password, conf.Host, conf.Port, conf.Table)
+		if err := DBConnect("mysql", connectionString, conf); err != nil {
+			panic(err)
+		}
+	case PostgresAdapter:
+		connectionString := fmt.Sprintf("postgresql://%s:%s@%s:%s/%s?sslmode=%s", conf.Username, conf.Password, conf.Host, conf.Port, conf.Table, conf.SSL)
+		if err := DBConnect("postgres", connectionString, conf); err != nil {
+			panic(err)
+		}
+	}
+}
+
+// Close DB connection
+func Close() {
+	DB.Close()
+}
+
+// DBConnect connects to db instance
+func DBConnect(gormAdapter string, connectionString string, conf DBConfig) (err error) {
+	DB, err = gorm.Open(gormAdapter, connectionString)
+	if err != nil {
+		return err
+	}
+	if err = DB.DB().Ping(); err != nil {
+		return err
+	}
+
+	DB.LogMode(conf.Logmode)
+
+	DB.Exec(fmt.Sprintf("SET TIMEZONE TO '%s'", conf.Timezone))
+	DB.DB().SetConnMaxLifetime(time.Second * time.Duration(conf.Maxlifetime))
+	DB.DB().SetMaxIdleConns(conf.IdleConnection)
+	DB.DB().SetMaxOpenConns(conf.OpenConnection)
+
+	return nil
+}
+
+// WithinTransaction sql execute helper
 func WithinTransaction(fn DBFunc) (err error) {
-	tx := db.Begin()
+	tx := DB.Begin()
 	defer tx.Commit()
 	err = fn(tx)
 
 	return err
 }
 
-// inserts a row into db.
+// Create creates row based on model
 func Create(i interface{}) error {
 	return WithinTransaction(func(tx *gorm.DB) (err error) {
-		if !tx.NewRecord(i) {
-			return err
+		if !DB.NewRecord(i) {
+			return fmt.Errorf("cannot create row. not a new record")
 		}
 		if err = tx.Create(i).Error; err != nil {
 			tx.Rollback()
@@ -60,12 +133,11 @@ func Create(i interface{}) error {
 	})
 }
 
-// update row in db.
+// Save updates row based on model
 func Save(i interface{}) error {
 	return WithinTransaction(func(tx *gorm.DB) (err error) {
-		// check new object
-		if tx.NewRecord(i) {
-			return err
+		if DB.NewRecord(i) {
+			return fmt.Errorf("cannot save row. it is a new record")
 		}
 		if err = tx.Save(i).Error; err != nil {
 			tx.Rollback()
@@ -75,10 +147,9 @@ func Save(i interface{}) error {
 	})
 }
 
-// delete row in db.
+// Delete removes row in db based on model.
 func Delete(i interface{}) error {
 	return WithinTransaction(func(tx *gorm.DB) (err error) {
-		// check new object
 		if err = tx.Delete(i).Error; err != nil {
 			tx.Rollback()
 			return err
@@ -87,9 +158,20 @@ func Delete(i interface{}) error {
 	})
 }
 
-// Find by id.
-func FindbyID(i interface{}, id int) error {
+// FirstOrCreate gets first matched record, or create a new one
+func FirstOrCreate(i interface{}) error {
 	return WithinTransaction(func(tx *gorm.DB) (err error) {
+		if err = tx.FirstOrCreate(i).Error; err != nil {
+			tx.Rollback()
+			return err
+		}
+		return err
+	})
+}
+
+// FindbyID finds row by id.
+func FindbyID(i interface{}, id int) (err error) {
+	return WithinTransaction(func(tx *gorm.DB) error {
 		if err = tx.Last(i, id).Error; err != nil {
 			tx.Rollback()
 			return err
@@ -98,110 +180,142 @@ func FindbyID(i interface{}, id int) error {
 	})
 }
 
-func FilterSearchSingle(i interface{}, filter interface{}) (err error) {
-	// filtering
-	refFilter := reflect.ValueOf(filter).Elem()
-	refType := refFilter.Type()
-	query(&db, refType)
+// SingleFindFilter finds by filter
+func SingleFindFilter(i interface{}, filter interface{}) (err error) {
+	query := DB // clone db connection
 
-	if err = db.Last(i).Error; err != nil {
-		db.Rollback()
-	}
+	query = conditionQuery(query, filter)
+
+	err = query.Last(i).Error
 
 	return err
 }
 
-func FilterSearch(i interface{}, filter interface{}) (err error) {
-	// filtering
-	refFilter := reflect.ValueOf(filter).Elem()
-	refType := refFilter.Type()
-	query(&db, refType)
+// FindFilter finds by filter. limit 0 to find all
+func FindFilter(i interface{}, order []string, sort []string, limit int, offset int, filter interface{}) (interface{}, error) {
+	query := DB // clone db connection
 
-	var total_rows int
-	if err = db.Find(i).Error; err != nil {
-		db.Rollback()
+	query = conditionQuery(query, filter)
+	query = orderSortQuery(query, order, sort)
+
+	if limit > 0 {
+		query = query.Limit(limit)
 	}
 
-	return err
+	if offset > 0 {
+		query = query.Offset(offset)
+	}
+
+	err := query.Find(i).Error
+
+	return i, err
 }
 
-func PagedFilterSearch(i interface{}, page int, rows int, orderby string, sort string, filter interface{}) (result PagedSearchResult, err error) {
+// PagedFindFilter same with FindFilter but with pagination
+func PagedFindFilter(i interface{}, page int, rows int, order []string, sort []string, filter interface{}, allfieldcondition ...string) (result PagedFindResult, err error) {
 	if page <= 0 {
 		page = 1
 	}
 
-	if rows <= 0 {
-		rows = 25 // default row is 25 per page
-	}
+	query := DB
 
-	// filtering
-	refFilter := reflect.ValueOf(filter).Elem()
-	refType := refFilter.Type()
-	query(&db, refType)
+	query = conditionQuery(query, filter)
+	query = orderSortQuery(query, order, sort)
 
-	// ordering and sorting
-	if orderby != "" {
-		orders := strings.Split(orderby, ",")
-		sort := strings.Split(sort, ",")
+	temp := query
+	var totalRows int
 
-		for k, v := range orders {
-			e := v
-			if len(sort) > k {
-				value := sort[k]
-				if strings.ToUpper(value) == "ASC" || strings.ToUpper(value) == "DESC" {
-					e = v + " " + strings.ToUpper(value)
-				}
-			}
-			db = db.Order(e)
-		}
-	}
+	temp.Find(i).Count(&totalRows)
 
-	tempDB := db
 	var (
-		total_rows int
-		lastPage   int = 1 // default 1
+		offset   int
+		lastPage int
 	)
 
-	tempDB.Find(i).Count(&total_rows)
+	if rows > 0 {
+		offset = (page * rows) - rows
+		lastPage = int(math.Ceil(float64(totalRows) / float64(rows)))
 
-	offset := (page * rows) - rows
-	lastPage = int(math.Ceil(float64(total_rows) / float64(rows)))
+		query = query.Limit(rows).Offset(offset)
+	}
 
-	b.DB.Limit(rows).Offset(offset).Find(i)
+	query.Find(i)
 
-	result = PagedSearchResult{
-		TotalData:   total_rows,
+	result = PagedFindResult{
+		TotalData:   totalRows,
 		Rows:        rows,
 		CurrentPage: page,
 		LastPage:    lastPage,
 		From:        offset + 1,
 		To:          offset + rows,
-		Data:        &i,
+		Data:        i,
 	}
 
 	return result, err
 }
 
-func query(db *gorm.DB, t reflect.Type) {
-	for x := 0; x < t.NumField(); x++ {
-		field := t.Field(x)
-		if field.Interface() != "" {
-			switch t.Field(x).Tag.Get("condition") {
+func conditionQuery(query *gorm.DB, filter interface{}) *gorm.DB {
+	refFilter := reflect.ValueOf(filter).Elem()
+	refType := refFilter.Type()
+	for x := 0; x < refFilter.NumField(); x++ {
+		field := refFilter.Field(x)
+		// check if empty
+		if !reflect.DeepEqual(field.Interface(), reflect.Zero(reflect.TypeOf(field.Interface())).Interface()) {
+			con := strings.Split(refType.Field(x).Tag.Get("condition"), ",")
+			tags := parseTag(refType.Field(x).Tag.Get("condition"))
+			switch con[0] {
 			default:
-				db = db.Where(fmt.Sprintf("%s = ?", t.Field(x).Tag.Get("json")), field.Interface())
-			case "LIKE":
-				db = db.Where(fmt.Sprintf("LOWER(%s) %s ?", t.Field(x).Tag.Get("json"), t.Field(x).Tag.Get("condition")), "%"+strings.ToLower(field.Interface().(string))+"%")
-			case "OR":
-				var e []string
-				for _, filter := range field.Interface().([]string) {
-					e = append(e, t.Field(x).Tag.Get("json")+" = '"+filter+"' ")
+				format := fmt.Sprintf("%s IN (?)", refType.Field(x).Tag.Get("json"))
+				if tags.Contains("optional") {
+					query = query.Or(format, field.Interface())
+				} else {
+					query = query.Where(format, field.Interface())
 				}
-				db = db.Where(strings.Join(e, " OR "))
+			case "LIKE":
+				format := fmt.Sprintf("LOWER(%s) %s ?", refType.Field(x).Tag.Get("json"), con[0])
+				field := "%" + strings.ToLower(field.Interface().(string)) + "%"
+				if tags.Contains("optional") {
+					query = query.Or(format, field)
+				} else {
+					query = query.Where(format, field)
+				}
 			case "BETWEEN":
 				if values, ok := field.Interface().(CompareFilter); ok && values.Value1 != "" {
-					db = db.Where(fmt.Sprintf("%s %s ? %s ?", t.Field(x).Tag.Get("json"), t.Field(x).Tag.Get("condition"), "AND"), values.Value1, values.Value2)
+					format := fmt.Sprintf("%s %s ? %s ?", refType.Field(x).Tag.Get("json"), con[0], "AND")
+					if tags.Contains("optional") {
+						query = query.Or(format, values.Value1, values.Value2)
+					} else {
+						query = query.Where(format, values.Value1, values.Value2)
+					}
+				}
+			case "OR":
+				var e []string
+				for _, v := range field.Interface().([]string) {
+					e = append(e, refType.Field(x).Tag.Get("json")+" = '"+v+"'")
+				}
+				if tags.Contains("optional") {
+					query = query.Or(strings.Join(e, " OR "))
+				} else {
+					query = query.Where(strings.Join(e, " OR "))
 				}
 			}
 		}
 	}
+
+	return query
+}
+
+func orderSortQuery(query *gorm.DB, order []string, sort []string) *gorm.DB {
+	for k, v := range order {
+		q := v
+		if len(sort) > k {
+			value := sort[k]
+			if strings.ToUpper(value) == "ASC" || strings.ToUpper(value) == "DESC" {
+				q = v + " " + strings.ToUpper(value)
+			}
+		}
+		query = query.Order(q)
+	}
+
+	return query
 }
