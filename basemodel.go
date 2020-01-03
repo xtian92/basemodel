@@ -40,9 +40,10 @@ type (
 
 	// BaseModel will be used as foundation of all models
 	BaseModel struct {
-		ID          uint64    `json:"id" sql:"AUTO_INCREMENT" gorm:"primary_key,column:id"`
-		CreatedTime time.Time `json:"created_time" gorm:"column:created_time" sql:"DEFAULT:current_timestamp"`
-		UpdatedTime time.Time `json:"updated_time" gorm:"column:updated_time" sql:"DEFAULT:current_timestamp"`
+		ID        uint64     `json:"id" gorm:"primary_key"`
+		CreatedAt time.Time  `json:"created_at"`
+		UpdatedAt time.Time  `json:"updated_at"`
+		DeletedAt *time.Time `json:"deleted_at" sql:"index"`
 	}
 
 	// DBFunc gorm trx function
