@@ -171,7 +171,7 @@ func FirstOrCreate(i interface{}) error {
 }
 
 // FindbyID finds row by id.
-func FindbyID(i interface{}, id int) (err error) {
+func FindbyID(i interface{}, id uint64) (err error) {
 	return WithinTransaction(func(tx *gorm.DB) error {
 		if err = tx.Last(i, id).Error; err != nil {
 			tx.Rollback()
