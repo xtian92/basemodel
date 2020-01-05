@@ -193,7 +193,7 @@ func SingleFindFilter(i interface{}, filter interface{}) (err error) {
 }
 
 // FindFilter finds by filter. limit 0 to find all
-func FindFilter(i interface{}, order []string, sort []string, limit int, offset int, filter interface{}) (interface{}, error) {
+func FindFilter(i interface{}, order []string, sort []string, limit int, offset int, filter interface{}) (err error) {
 	query := DB // clone db connection
 
 	query = conditionQuery(query, filter)
@@ -207,9 +207,9 @@ func FindFilter(i interface{}, order []string, sort []string, limit int, offset 
 		query = query.Offset(offset)
 	}
 
-	err := query.Find(i).Error
+	err = query.Find(i).Error
 
-	return i, err
+	return err
 }
 
 // PagedFindFilter same with FindFilter but with pagination
